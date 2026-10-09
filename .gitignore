@@ -1,0 +1,604 @@
+import * as THREE from 'three';
+import './style.css';
+
+const app = document.querySelector('#app');
+app.innerHTML = `
+  <div id="hud">
+    <h1>OASIS VR</h1>
+    <div id="money">Money: $5000</div>
+    <div id="inventory">Inventory: starter pack</div>
+    <div id="stats">World: Neon District</div>
+  </div>
+  <div id="controls">
+    <button id="vrButton">Enter VR</button>
+    <button id="buyCarButton">Buy Car ($1500)</button>
+    <button id="buyHomeButton">Buy Home ($2500)</button>
+    <button id="buildModeButton">Build Mode</button>
+  </div>
+  <div id="status">Walk around, hit E near the job pad, or build your world.</div>
+`;
+
+const moneyLabel = document.querySelector('#money');
+const inventoryLabel = document.querySelector('#inventory');
+const statsLabel = document.querySelector('#stats');
+const statusLabel = document.querySelector('#status');
+const vrButton = document.querySelector('#vrButton');
+const buyCarButton = document.querySelector('#buyCarButton');
+const buyHomeButton = document.querySelector('#buyHomeButton');
+const buildModeButton = document.querySelector('#buildModeButton');
+
+const state = {
+  money: 5000,
+  inventory: ['starter pack'],
+  buildMode: false,
+  ownedCar: false,
+  ownedHome: false,
+  mood: 'open world',
+  message: 'Walk around, hit E near the job pad, or build your world.'
+};
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x9dd7ff);
+scene.fog = new THREE.Fog(0x9dd7ff, 30, 90);
+
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+camera.position.set(0, 3.2, 11);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const clock = new THREE.Clock();
+const world = new THREE.Group();
+scene.add(world);
+
+const player = {
+  height: 1.75,
+  radius: 0.5,
+  speed: 7,
+  velocity: new THREE.Vector3(),
+  direction: new THREE.Vector3(),
+  yaw: 0,
+  pitch: 0
+};
+
+const keys = {};
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2(0, 0);
+const moveVector = new THREE.Vector3();
+const worldPosition = new THREE.Vector3();
+const tempVector = new THREE.Vector3();
+const focusTarget = new THREE.Vector3();
+
+const interactables = [];
+let buildGhost = null;
+let currentBuildMesh = null;
+
+function updateHud() {
+  moneyLabel.textContent = `Money: $${state.money}`;
+  inventoryLabel.textContent = `Inventory: ${state.inventory.join(', ')}`;
+  statsLabel.textContent = `World: Neon District | ${state.mood}`;
+  statusLabel.textContent = state.message;
+}
+
+function setStatus(message) {
+  state.message = message;
+  updateHud();
+}
+
+function createAmbient() {
+  const hemi = new THREE.HemisphereLight(0xbfe9ff, 0x2c3a2f, 1.2);
+  scene.add(hemi);
+
+  const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+  sun.position.set(25, 30, 12);
+  sun.castShadow = true;
+  sun.shadow.mapSize.width = 2048;
+  sun.shadow.mapSize.height = 2048;
+  sun.shadow.camera.left = -60;
+  sun.shadow.camera.right = 60;
+  sun.shadow.camera.top = 60;
+  sun.shadow.camera.bottom = -60;
+  scene.add(sun);
+
+  const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(200, 32, 32),
+    new THREE.MeshBasicMaterial({ color: 0x9bc9ff, side: THREE.BackSide })
+  );
+  scene.add(sky);
+
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(220, 220),
+    new THREE.MeshStandardMaterial({ color: 0x2d7d46, roughness: 0.92, metalness: 0.03 })
+  );
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  world.add(ground);
+
+  const roadMaterial = new THREE.MeshStandardMaterial({ color: 0x2b2d30, roughness: 0.9, metalness: 0.18 });
+  const road = new THREE.Mesh(new THREE.BoxGeometry(120, 0.2, 8), roadMaterial);
+  road.position.set(0, 0.1, 0);
+  road.receiveShadow = true;
+  world.add(road);
+
+  const roadStripe1 = new THREE.Mesh(new THREE.BoxGeometry(8, 0.05, 0.4), new THREE.MeshStandardMaterial({ color: 0xffffff }));
+  roadStripe1.position.set(-30, 0.21, 0);
+  world.add(roadStripe1);
+
+  for (let i = -40; i <= 40; i += 12) {
+    const stripe = roadStripe1.clone();
+    stripe.position.x = i;
+    world.add(stripe);
+  }
+}
+
+function addBuilding(x, z, width, depth, height, color = 0x5865f2) {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(width, height, depth),
+    new THREE.MeshStandardMaterial({ color, roughness: 0.7, metalness: 0.2 })
+  );
+  mesh.position.set(x, height / 2, z);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  world.add(mesh);
+
+  const roof = new THREE.Mesh(
+    new THREE.BoxGeometry(width + 0.5, 0.5, depth + 0.5),
+    new THREE.MeshStandardMaterial({ color: 0x9ad5ff, roughness: 0.9, metalness: 0.1 })
+  );
+  roof.position.set(x, height + 0.25, z);
+  world.add(roof);
+}
+
+function addTree(x, z, scale = 1) {
+  const trunk = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.25 * scale, 0.35 * scale, 2.5 * scale, 8),
+    new THREE.MeshStandardMaterial({ color: 0x7d4f2f, roughness: 0.9 })
+  );
+  trunk.position.set(x, 1.25 * scale, z);
+  trunk.castShadow = true;
+  world.add(trunk);
+
+  const leaves = new THREE.Mesh(
+    new THREE.SphereGeometry(1.2 * scale, 16, 16),
+    new THREE.MeshStandardMaterial({ color: 0x204f2f, roughness: 0.8 })
+  );
+  leaves.position.set(x, 3.1 * scale, z);
+  leaves.castShadow = true;
+  world.add(leaves);
+}
+
+function createHome(x, z) {
+  const home = new THREE.Group();
+
+  const base = new THREE.Mesh(
+    new THREE.BoxGeometry(4, 2.5, 4),
+    new THREE.MeshStandardMaterial({ color: 0x8ec5ff, roughness: 0.7, metalness: 0.25 })
+  );
+  base.position.y = 1.25;
+  base.castShadow = true;
+  base.receiveShadow = true;
+  home.add(base);
+
+  const roof = new THREE.Mesh(
+    new THREE.ConeGeometry(2.8, 1.6, 4),
+    new THREE.MeshStandardMaterial({ color: 0xffa45f, roughness: 0.75 })
+  );
+  roof.rotation.y = Math.PI / 4;
+  roof.position.y = 3.1;
+  roof.castShadow = true;
+  home.add(roof);
+
+  home.position.set(x, 0, z);
+  world.add(home);
+  interactables.push({ type: 'home', mesh: home, position: home.position.clone() });
+  return home;
+}
+
+function createCar(x, z) {
+  const car = new THREE.Group();
+
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(3.2, 0.9, 1.6),
+    new THREE.MeshStandardMaterial({ color: 0x3d8bfd, roughness: 0.45, metalness: 0.7 })
+  );
+  body.position.y = 0.8;
+  car.add(body);
+
+  const cabin = new THREE.Mesh(
+    new THREE.BoxGeometry(1.8, 0.8, 1.4),
+    new THREE.MeshStandardMaterial({ color: 0xbfe9ff, roughness: 0.25, metalness: 0.8 })
+  );
+  cabin.position.set(0.2, 1.45, 0);
+  car.add(cabin);
+
+  const wheelMaterial = new THREE.MeshStandardMaterial({ color: 0x141414, roughness: 0.9 });
+  const wheelGeom = new THREE.CylinderGeometry(0.42, 0.42, 0.3, 16);
+  const wheelPositions = [
+    [-1, 0.35, 0.95],
+    [1, 0.35, 0.95],
+    [-1, 0.35, -0.95],
+    [1, 0.35, -0.95]
+  ];
+
+  wheelPositions.forEach(([x, y, z]) => {
+    const wheel = new THREE.Mesh(wheelGeom, wheelMaterial);
+    wheel.rotation.z = Math.PI / 2;
+    wheel.position.set(x, y, z);
+    car.add(wheel);
+  });
+
+  car.position.set(x, 0, z);
+  car.rotation.y = Math.PI;
+  world.add(car);
+  interactables.push({ type: 'car', mesh: car, position: car.position.clone() });
+  return car;
+}
+
+function createJobPad() {
+  const pad = new THREE.Mesh(
+    new THREE.CylinderGeometry(2.2, 2.2, 0.3, 32),
+    new THREE.MeshStandardMaterial({ color: 0x415fb8, emissive: 0x112c7e, roughness: 0.8 })
+  );
+  pad.position.set(12, 0.15, -12);
+  pad.castShadow = true;
+  pad.receiveShadow = true;
+  world.add(pad);
+
+  const tag = new THREE.Mesh(
+    new THREE.BoxGeometry(0.8, 0.8, 0.2),
+    new THREE.MeshStandardMaterial({ color: 0xf5c451 })
+  );
+  tag.position.set(12, 1.1, -12);
+  world.add(tag);
+
+  interactables.push({ type: 'job', mesh: pad, position: pad.position.clone(), reward: 250 });
+  return pad;
+}
+
+function createMarketStand() {
+  const stand = new THREE.Mesh(
+    new THREE.BoxGeometry(3.5, 2.2, 2.2),
+    new THREE.MeshStandardMaterial({ color: 0xf59e0b, roughness: 0.8 })
+  );
+  stand.position.set(-16, 1.1, 10);
+  stand.castShadow = true;
+  stand.receiveShadow = true;
+  world.add(stand);
+
+  interactables.push({ type: 'market', mesh: stand, position: stand.position.clone() });
+  return stand;
+}
+
+function createWorld() {
+  addBuilding(-18, -20, 16, 12, 16, 0x5f6dff);
+  addBuilding(20, -18, 14, 10, 12, 0x7dd3fc);
+  addBuilding(-24, 20, 11, 11, 14, 0x8b5cf6);
+  addBuilding(25, 18, 12, 13, 16, 0xff7b7b);
+
+  for (let i = -30; i <= 30; i += 8) {
+    addTree(i, -28, 1.2);
+    addTree(i, 28, 1.0);
+  }
+
+  createHome(10, 16);
+  createHome(-14, -6);
+  createCar(20, 0);
+  createJobPad();
+  createMarketStand();
+}
+
+function addPlayerVisual() {
+  const body = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.5, 1.4, 4, 10),
+    new THREE.MeshStandardMaterial({ color: 0x36d399, roughness: 0.7 })
+  );
+  body.position.y = 1.3;
+  body.castShadow = true;
+  world.add(body);
+
+  const head = new THREE.Mesh(
+    new THREE.SphereGeometry(0.42, 18, 18),
+    new THREE.MeshStandardMaterial({ color: 0xf4d7b7 })
+  );
+  head.position.y = 2.6;
+  head.castShadow = true;
+  world.add(head);
+
+  const playerAnchor = new THREE.Object3D();
+  playerAnchor.position.set(0, 0, 6);
+  world.add(playerAnchor);
+
+  player.anchor = playerAnchor;
+}
+
+function createBuildGhost() {
+  const ghost = new THREE.Mesh(
+    new THREE.BoxGeometry(2.2, 2.2, 2.2),
+    new THREE.MeshStandardMaterial({ color: 0x4ade80, emissive: 0x1d4d2a, transparent: true, opacity: 0.5 })
+  );
+  ghost.visible = false;
+  scene.add(ghost);
+  buildGhost = ghost;
+}
+
+function updateBuildGhost() {
+  if (!buildGhost || !state.buildMode) return;
+
+  raycaster.setFromCamera(pointer, camera);
+  const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  const hitPoint = new THREE.Vector3();
+  raycaster.ray.intersectPlane(groundPlane, hitPoint);
+
+  if (hitPoint) {
+    buildGhost.visible = true;
+    buildGhost.position.set(Math.round(hitPoint.x / 2) * 2, 1.1, Math.round(hitPoint.z / 2) * 2);
+  }
+}
+
+function createBuildObject(kind = 'home') {
+  let mesh;
+  if (kind === 'home') {
+    mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(2.2, 2.2, 2.2),
+      new THREE.MeshStandardMaterial({ color: 0x8ec5ff, roughness: 0.7 })
+    );
+  } else if (kind === 'car') {
+    mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(3.2, 1, 1.8),
+      new THREE.MeshStandardMaterial({ color: 0x60a5fa, roughness: 0.5 })
+    );
+  } else {
+    mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.8, 1.2, 2.4, 8),
+      new THREE.MeshStandardMaterial({ color: 0x22c55e, roughness: 0.8 })
+    );
+  }
+
+  mesh.position.copy(buildGhost.position);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  world.add(mesh);
+  currentBuildMesh = mesh;
+  state.inventory.push(kind);
+  setStatus(`${kind} created in your world. Your sandbox is growing.`);
+  updateHud();
+}
+
+function handleBuildPlacement() {
+  if (!state.buildMode) {
+    setStatus('Build mode is off. Press Build Mode to create structures.');
+    return;
+  }
+
+  createBuildObject('home');
+  const base = buildGhost.position.clone();
+  const globe = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.4, 0.4, 0.7, 16),
+    new THREE.MeshStandardMaterial({ color: 0xf5d76e })
+  );
+  globe.position.copy(base).add(new THREE.Vector3(0, 1.5, 0));
+  world.add(globe);
+}
+
+function buyCar() {
+  if (state.ownedCar) {
+    setStatus('You already own a vehicle. Use the world market to customize it.');
+    return;
+  }
+
+  if (state.money < 1500) {
+    setStatus('Not enough money yet. Earn more by using the job pad.');
+    return;
+  }
+
+  state.money -= 1500;
+  state.ownedCar = true;
+  state.inventory.push('car');
+  const car = createCar(0, 0);
+  car.position.set(0, 0, -6);
+  setStatus('Vehicle purchased. Your garage is now in the world.');
+  updateHud();
+}
+
+function buyHome() {
+  if (state.ownedHome) {
+    setStatus('You already own a home in the city.');
+    return;
+  }
+
+  if (state.money < 2500) {
+    setStatus('You need more credits before buying a personal home.');
+    return;
+  }
+
+  state.money -= 2500;
+  state.ownedHome = true;
+  state.inventory.push('home');
+  const home = createHome(-10, 0);
+  home.position.set(-10, 0, 0);
+  setStatus('Home purchased. You now own a property in the district.');
+  updateHud();
+}
+
+function earnMoney() {
+  const playerPos = player.anchor.position.clone();
+  const padPos = new THREE.Vector3(12, 0, -12);
+  if (playerPos.distanceTo(padPos) < 4) {
+    state.money += 250;
+    state.inventory.push('credits');
+    setStatus('Job completed. You earned $250.');
+    updateHud();
+  } else {
+    setStatus('Move toward the glowing job pad to earn money.');
+  }
+}
+
+function handleInput() {
+  const move = new THREE.Vector3(
+    (keys['KeyD'] || keys['ArrowRight'] ? 1 : 0) - (keys['KeyA'] || keys['ArrowLeft'] ? 1 : 0),
+    0,
+    (keys['KeyW'] || keys['ArrowUp'] ? 1 : 0) - (keys['KeyS'] || keys['ArrowDown'] ? 1 : 0)
+  );
+
+  if (move.lengthSq() > 0) {
+    move.normalize();
+    const yaw = player.yaw;
+    const forward = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+    const right = new THREE.Vector3(forward.z, 0, -forward.x);
+    player.direction.copy(forward.multiplyScalar(move.z)).add(right.multiplyScalar(move.x));
+    player.direction.normalize();
+    player.anchor.position.addScaledVector(player.direction, player.speed * clock.getDelta());
+  }
+
+  const x = player.anchor.position.x;
+  const z = player.anchor.position.z;
+  player.anchor.position.x = THREE.MathUtils.clamp(x, -75, 75);
+  player.anchor.position.z = THREE.MathUtils.clamp(z, -75, 75);
+}
+
+function updateCamera() {
+  camera.position.copy(player.anchor.position).add(new THREE.Vector3(0, 3.2, 0));
+  camera.rotation.y = player.yaw;
+}
+
+function setupPointerLock() {
+  document.addEventListener('pointerdown', () => {
+    if (document.pointerLockElement !== document.body) {
+      document.body.requestPointerLock();
+    }
+  });
+
+  document.addEventListener('mousemove', (event) => {
+    if (document.pointerLockElement === document.body) {
+      player.yaw -= event.movementX * 0.0025;
+      player.pitch -= event.movementY * 0.002;
+      player.pitch = THREE.MathUtils.clamp(player.pitch, -1.3, 1.3);
+      camera.rotation.order = 'YXZ';
+      camera.rotation.y = player.yaw;
+      camera.rotation.x = player.pitch;
+    }
+  });
+}
+
+function setupKeyboard() {
+  document.addEventListener('keydown', (event) => {
+    keys[event.code] = true;
+
+    if (event.code === 'KeyE') earnMoney();
+    if (event.code === 'KeyB') {
+      state.buildMode = !state.buildMode;
+      buildGhost.visible = state.buildMode;
+      setStatus(state.buildMode ? 'Build mode active. Click to place a structure.' : 'Build mode off.');
+    }
+    if (event.code === 'KeyC') buyCar();
+    if (event.code === 'KeyH') buyHome();
+    if (event.code === 'Space') {
+      if (state.buildMode) {
+        handleBuildPlacement();
+      }
+    }
+  });
+
+  document.addEventListener('keyup', (event) => {
+    keys[event.code] = false;
+  });
+}
+
+function setupClickPlacement() {
+  window.addEventListener('click', () => {
+    if (state.buildMode) {
+      handleBuildPlacement();
+    }
+  });
+}
+
+function setupVRButton() {
+  vrButton.addEventListener('click', async () => {
+    if (!navigator.xr) {
+      setStatus('WebXR is not available in this browser. Try a Meta Quest browser or Chromium-based VR enabled browser.');
+      return;
+    }
+
+    try {
+      const session = await navigator.xr.requestSession('immersive-vr', {
+        optionalFeatures: ['local-floor', 'bounded-floor'],
+        requiredFeatures: ['local-floor']
+      });
+      renderer.xr.setReferenceSpaceType('local-floor');
+      await renderer.xr.setSession(session);
+      setStatus('VR session started. Use the headset to explore the city.');
+    } catch (error) {
+      setStatus('VR launch failed. This browser/device may not support immersive VR mode.');
+    }
+  });
+}
+
+function animate() {
+  const delta = clock.getDelta();
+  updateBuildGhost();
+
+  if (keys['KeyW'] || keys['KeyA'] || keys['KeyS'] || keys['KeyD'] || keys['ArrowUp'] || keys['ArrowDown'] || keys['ArrowLeft'] || keys['ArrowRight']) {
+    const speed = 7;
+    const strafe = new THREE.Vector3();
+    const forward = new THREE.Vector3(Math.sin(player.yaw), 0, Math.cos(player.yaw));
+    const right = new THREE.Vector3(forward.z, 0, -forward.x);
+
+    if (keys['KeyW'] || keys['ArrowUp']) strafe.add(forward);
+    if (keys['KeyS'] || keys['ArrowDown']) strafe.sub(forward);
+    if (keys['KeyD'] || keys['ArrowRight']) strafe.add(right);
+    if (keys['KeyA'] || keys['ArrowLeft']) strafe.sub(right);
+
+    if (strafe.lengthSq() > 0) {
+      strafe.normalize().multiplyScalar(speed * delta);
+      player.anchor.position.add(strafe);
+    }
+  }
+
+  player.anchor.position.x = THREE.MathUtils.clamp(player.anchor.position.x, -78, 78);
+  player.anchor.position.z = THREE.MathUtils.clamp(player.anchor.position.z, -78, 78);
+
+  const target = player.anchor.position.clone();
+  target.y += 3.1;
+  focusTarget.copy(target);
+  camera.position.lerp(target, 0.12);
+  camera.lookAt(player.anchor.position.clone().add(new THREE.Vector3(0, 1.8, 0)).add(new THREE.Vector3(Math.sin(player.yaw), 0, Math.cos(player.yaw)).multiplyScalar(10)));
+
+  if (state.buildMode) {
+    updateBuildGhost();
+  }
+
+  renderer.render(scene, camera);
+}
+
+createAmbient();
+createWorld();
+addPlayerVisual();
+createBuildGhost();
+setupPointerLock();
+setupKeyboard();
+setupClickPlacement();
+setupVRButton();
+
+buyCarButton.addEventListener('click', buyCar);
+buyHomeButton.addEventListener('click', buyHome);
+buildModeButton.addEventListener('click', () => {
+  state.buildMode = !state.buildMode;
+  buildGhost.visible = state.buildMode;
+  setStatus(state.buildMode ? 'Build mode active. Click anywhere to create a structure.' : 'Build mode off.');
+});
+
+camera.position.set(0, 4, 12);
+updateHud();
+renderer.setAnimationLoop(animate);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
